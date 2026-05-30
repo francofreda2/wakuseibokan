@@ -302,7 +302,9 @@ def solve_moving_intercept(shooter_xz: tuple[float, float],
             break
         decl, tof, lead_x, lead_z = new_decl, new_tof, new_lead_x, new_lead_z
 
-    bearing_world_deg = math.degrees(math.atan2(lead_x - sx, lead_z - sz))
+    # Convencion C++: azimuth crece clockwise desde +z (norte), o sea
+    # +z=0, -x=90 (oeste), -z=180, +x=270 (este). Por eso negamos dx.
+    bearing_world_deg = math.degrees(math.atan2(-(lead_x - sx), lead_z - sz))
     return {
         'decl_deg': decl,
         'bearing_world_deg': bearing_world_deg,

@@ -341,7 +341,8 @@ class Strategist:
 
         # ---------- 1b) Detectar fuego enemigo via radar de impactos ----------
         incoming_fire = self._detect_incoming_fire(mine, timer)
-        bearing_to_rival = math.degrees(math.atan2(his_x - my_x, his_z - my_z))
+        # convencion C++ (ver Ballistic.solve_moving_intercept)
+        bearing_to_rival = math.degrees(math.atan2(-(his_x - my_x), his_z - my_z))
         if intercept is None:
             turret_decl = 0.0
             turret_bearing = world_bearing_to_turret(bearing_to_rival, my_az)
@@ -395,8 +396,11 @@ class Strategist:
             thrust = max(min(thrust, 8.0), -8.0)
 
         # ---------- 6) Disparo ----------
+        # El canion rota libremente; aim_err (= cuanto rota la torreta desde
+        # el frente del chasis) NO indica precision. Lo unico relevante:
+        # tenemos solucion balistica y municion. SmartLead nos saca a tiros
+        # con su volumen — disparamos siempre que podemos.
         fire_ok = (fire_lock == 'OK'
-                   and aim_error < max_aim_error
                    and my_pw > 20
                    and intercept is not None)
 

@@ -159,7 +159,7 @@ class SmartLead(_Base):
         intercept = solve_moving_intercept((my_x, my_z), (ox, oz),
                                            self._other_vel, self.table)
         if intercept is None:
-            world_bearing = math.degrees(math.atan2(ox - my_x, oz - my_z))
+            world_bearing = math.degrees(math.atan2(-(ox - my_x), oz - my_z))
             turret_decl = 0.0
             turret_bearing = world_bearing_to_turret(world_bearing, my_az)
         else:
@@ -211,7 +211,7 @@ class Sniper(_Base):
 
         intercept = solve_moving_intercept((my_x, my_z), (ox, oz),
                                            self._other_vel, self.table)
-        world_bearing = math.degrees(math.atan2(ox - my_x, oz - my_z))
+        world_bearing = math.degrees(math.atan2(-(ox - my_x), oz - my_z))
         if intercept is None:
             turret_decl = 0.0
             turret_bearing = world_bearing_to_turret(world_bearing, my_az)
@@ -249,7 +249,7 @@ class Rusher(_Base):
         ox = float(other[td['x']]); oz = float(other[td['z']])
 
         dist = math.hypot(ox - my_x, oz - my_z)
-        world_bearing = math.degrees(math.atan2(ox - my_x, oz - my_z))
+        world_bearing = math.degrees(math.atan2(-(ox - my_x), oz - my_z))
         aim = self.table.aim(dist) if dist > 0 else None
         turret_decl = aim[0] if aim is not None else 0.0
         turret_bearing = world_bearing_to_turret(world_bearing, my_az)
@@ -295,7 +295,7 @@ class Zigzag(_Base):
 
         intercept = solve_moving_intercept((my_x, my_z), (ox, oz),
                                            self._other_vel, self.table)
-        world_bearing = math.degrees(math.atan2(ox - my_x, oz - my_z))
+        world_bearing = math.degrees(math.atan2(-(ox - my_x), oz - my_z))
         if intercept is None:
             turret_decl = 0.0
             turret_bearing = world_bearing_to_turret(world_bearing, my_az)
