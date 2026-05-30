@@ -378,11 +378,20 @@ class Strategist:
 
         # ---------- 4) PID heading (chasis -> direccion deseada) ----------
         steering = self.heading_pid.step(heading_sp, my_az, dt)
+        chassis_err = abs(normalize_angle_deg(heading_sp - my_az))
 
         # ---------- 5) PID distancia (acercarse / retroceder) ----------
         # error positivo = estamos mas lejos => avanzar (thrust > 0).
         # error negativo = estamos mas cerca  => retroceder (thrust < 0).
         thrust = self.distance_pid.step(distance_sp, dist, dt)
+
+        # Si el chasis esta muy desorientado, parar y solo rotar.
+        # Avanzar mientras rotamos genera espirales que nunca llegan al rival.
+        if chassis_err > 30.0:
+            thrust = 0.0
+        elif chassis_err > 10.0:
+            # rotacion casi ok: avanzar a velocidad reducida
+            thrust = max(min(thrust, 8.0), -8.0)
 
         # ---------- 6) Disparo ----------
         fire_ok = (fire_lock == 'OK'

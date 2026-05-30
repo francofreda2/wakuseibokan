@@ -166,8 +166,14 @@ class SmartLead(_Base):
             turret_decl = intercept['decl_deg']
             turret_bearing = world_bearing_to_turret(intercept['bearing_world_deg'], my_az)
 
-        # control naive: avanzar si lejos, frenar si cerca, steering bang-bang
-        thrust = 15.0 if dist > 1500 else (10.0 if dist > 800 else 0.0)
+        # No avanzar si no estamos mirando al rival (evitar espirales).
+        chassis_err = abs(turret_bearing)
+        if chassis_err > 30:
+            thrust = 0.0
+        elif chassis_err > 10:
+            thrust = 6.0
+        else:
+            thrust = 15.0 if dist > 1500 else (10.0 if dist > 800 else 0.0)
         steering = 0.5 if turret_bearing > 0 else (-0.5 if turret_bearing < 0 else 0.0)
         fire = abs(turret_bearing) < 0.8 and my_pw > 20
         return dict(thrust=thrust, steering=steering,
