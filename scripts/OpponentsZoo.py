@@ -123,9 +123,9 @@ class _Base:
             if d.get('fire'):
                 self.command.command = FIRE
             self.command.send_command(
-                timer, self.tank_id,
-                d['thrust'], d['steering'],
-                d['turret_decl'], d['turret_bearing'],
+                int(timer), int(self.tank_id),
+                float(d['thrust']), float(d['steering']),
+                float(d['turret_decl']), float(d['turret_bearing']),
             )
 
 

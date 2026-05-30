@@ -161,6 +161,18 @@ class Strategist:
         # historial reciente de health propio para detectar que nos pegan
         self._health_history: deque[tuple[float, float]] = deque(maxlen=20)
 
+        # Anti-stuck: si la posicion no cambia mucho en STUCK_WINDOW_TICKS
+        # ticks mientras estoy pidiendo thrust, gatillo maniobra de despegue.
+        # En escenario 131 las warehouses y las pendientes nos pueden trabar.
+        self._pos_history: deque[tuple[float, float, float]] = deque(maxlen=40)
+        # (timer, x, z)
+        self.STUCK_WINDOW_TICKS = 60       # ~3 s de telemetria
+        self.STUCK_DISPLACEMENT_M = 5.0    # menos que esto = stuck
+        self.STUCK_THRUST_THRESHOLD = 5.0  # solo aplica si estaba intentando avanzar
+        self.UNSTUCK_DURATION_TICKS = 50   # cuanto durar la maniobra
+        self._unstuck_until: float | None = None
+        self._unstuck_dir: int = 1         # signo del giro durante unstuck
+
     # ------------------ I/O telemetria ------------------
 
     def _read_one(self) -> tuple | None:
@@ -242,6 +254,22 @@ class Strategist:
                     max(dist, 1500.0), 'NO')
         # default conservador
         return bearing_to_rival, dist, 'NO'
+
+    def _is_stuck(self, timer: float, x: float, z: float) -> bool:
+        """Detecta si estamos atorados: la posicion no cambio en
+        STUCK_WINDOW_TICKS ticks. No miramos thrust porque el agente puede
+        haber decidido frenarse a si mismo y eso no es estar trabado.
+        Por eso ADEMAS pediremos que la politica activa requiera moverse.
+        """
+        self._pos_history.append((timer, x, z))
+        if len(self._pos_history) < self.STUCK_WINDOW_TICKS // 2:
+            return False
+        oldest = self._pos_history[0]
+        dt = timer - oldest[0]
+        if dt < self.STUCK_WINDOW_TICKS * 0.5:
+            return False
+        displacement = math.hypot(x - oldest[1], z - oldest[2])
+        return displacement < self.STUCK_DISPLACEMENT_M
 
     def _detect_incoming_fire(self, mine: tuple, timer: float) -> bool:
         """Lee el radar de impactos del simulador. En scenario 131 se actualiza
@@ -359,17 +387,42 @@ class Strategist:
                    and my_pw > 20
                    and intercept is not None)
 
-        # ---------- 7) Reaccion defensiva ----------
-        # 7a) Hit reciente => zigzag forzado
+        # ---------- 7a) Anti-stuck: si estoy clavado, reversa y giro inverso ----------
+        # Si ya estamos en una maniobra de unstuck, mantenerla hasta que termine
+        if self._unstuck_until is not None and timer < self._unstuck_until:
+            thrust = -20.0
+            steering = float(self._unstuck_dir) * 1.0
+            # reseteo PIDs para que no acumulen integral durante unstuck
+            self.heading_pid.reset()
+            self.distance_pid.reset()
+        else:
+            if self._unstuck_until is not None and timer >= self._unstuck_until:
+                self._unstuck_until = None
+                self.heading_pid.reset()
+                self.distance_pid.reset()
+            # Stuck = posicion no cambia. Lo evaluamos siempre que estemos
+            # pidiendo algun movimiento (thrust no nulo, o steering significativo
+            # esperando rotar el chasis). En SNIPER el thrust es 0 pero igual
+            # queremos detectar si el chasis no logra girar para apuntar.
+            wants_to_move = abs(steering) > 0.3 or abs(thrust) > 5.0
+            if wants_to_move and self._is_stuck(timer, my_x, my_z):
+                self._unstuck_until = timer + self.UNSTUCK_DURATION_TICKS
+                # girar en sentido opuesto al heading actual deseado
+                self._unstuck_dir = -1 if (turret_bearing > 0) else 1
+                thrust = -20.0
+                steering = float(self._unstuck_dir) * 1.0
+                self._pos_history.clear()
+
+        # ---------- 7b) Reaccion defensiva ----------
         forced = False
         if len(self._health_history) >= 2:
             recent_loss = self._health_history[0][1] - self._health_history[-1][1]
             if recent_loss > 5:
                 forced = True
-        # 7b) Radar detecto impactos cerca (scenario 131) => evasion preventiva
         if incoming_fire:
             forced = True
-        if forced:
+        # solo aplicar zigzag forzado si NO estamos en maniobra de unstuck
+        if forced and self._unstuck_until is None:
             forced_offset = self._zigzag_heading_offset()
             steering = self.heading_pid.step(heading_sp + forced_offset, my_az, dt)
             thrust = max(thrust, 12.0)
@@ -389,6 +442,7 @@ class Strategist:
             policy=policy,
             profile=profile,
             incoming_fire=incoming_fire,
+            unstuck=(self._unstuck_until is not None and timer < self._unstuck_until),
             height_diff=his_y - my_y,
             pid_h=(self.heading_pid.last_p, self.heading_pid.last_i, self.heading_pid.last_d),
             pid_d=(self.distance_pid.last_p, self.distance_pid.last_i, self.distance_pid.last_d),
@@ -410,6 +464,7 @@ class Strategist:
             f"steer={decision['steering']:+5.2f} thrust={decision['thrust']:+6.2f} "
             f"aim_err={decision['aim_error']:5.2f} fire={'Y' if decision['fire_ok'] else '-'} "
             f"INFIRE={'!' if decision['incoming_fire'] else ' '} "
+            f"UNSTUCK={'U' if decision.get('unstuck') else '.'} "
             f"|| {prof.style}({prof.confidence:.1f})"
         )
 
@@ -434,12 +489,12 @@ class Strategist:
             if decision['fire_ok']:
                 self.command.command = FIRE
             self.command.send_command(
-                decision['timer'],
-                self.tank_id,
-                decision['thrust'],
-                decision['steering'],
-                decision['turret_decl'],
-                decision['turret_bearing'],
+                int(decision['timer']),
+                int(self.tank_id),
+                float(decision['thrust']),
+                float(decision['steering']),
+                float(decision['turret_decl']),
+                float(decision['turret_bearing']),
             )
             self._print_status(decision, mine)
 
@@ -477,6 +532,13 @@ def _self_test() -> None:
     s.ZIGZAG_PERIOD_TICKS = 30
     s.ZIGZAG_AMPLITUDE_DEG = 35.0
     s._health_history = deque(maxlen=20)
+    s._pos_history = deque(maxlen=40)
+    s.STUCK_WINDOW_TICKS = 60
+    s.STUCK_DISPLACEMENT_M = 5.0
+    s.STUCK_THRUST_THRESHOLD = 5.0
+    s.UNSTUCK_DURATION_TICKS = 50
+    s._unstuck_until = None
+    s._unstuck_dir = 1
 
     def fake_tel(number, x, z, az, hp, pw, timer, y=10.0,
                  radarx=0.0, radary=0.0, radarz=0.0):
