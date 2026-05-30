@@ -413,12 +413,11 @@ class Strategist:
                 self._unstuck_until = None
                 self.heading_pid.reset()
                 self.distance_pid.reset()
-            # Stuck = posicion no cambia. Lo evaluamos siempre que estemos
-            # pidiendo algun movimiento (thrust no nulo, o steering significativo
-            # esperando rotar el chasis). En SNIPER el thrust es 0 pero igual
-            # queremos detectar si el chasis no logra girar para apuntar.
-            wants_to_move = abs(steering) > 0.3 or abs(thrust) > 5.0
-            if wants_to_move and self._is_stuck(timer, my_x, my_z):
+            # Stuck = pedimos avanzar (thrust no trivial) pero la posicion
+            # no cambia. Si solo estamos rotando en el lugar (SNIPER, OBSERVE)
+            # NO es stuck — es comportamiento deseado.
+            wants_to_translate = abs(thrust) > 5.0
+            if wants_to_translate and self._is_stuck(timer, my_x, my_z):
                 self._unstuck_until = timer + self.UNSTUCK_DURATION_TICKS
                 # girar en sentido opuesto al heading actual deseado
                 self._unstuck_dir = -1 if (turret_bearing > 0) else 1
