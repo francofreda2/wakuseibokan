@@ -184,13 +184,11 @@ size_t TestCase_111::addTank(BoxIsland *nemesis, int faction, int walusnumber,GL
     _otter->enableAuto();
     _otter->enableTelemetry();
 
-    Wheel *l,*r,*bl,*br;
+    // @NOTE Fix: NO resetear las ruedas a la posicion del chasis. attachTo()
+    // ya las dejo en la posicion correcta (chassis + offset). Si las movemos
+    // al centro del chasis, el joint hinge2 explota y el tanque queda atorado
+    // o rebotando al spawn.
     _otter->setPos(p);
-    _otter->getWheels(l,r,bl,br);
-    l->setPos(p);
-    r->setPos(p);
-    bl->setPos(p);
-    br->setPos(p);
 
     return id;
 }

@@ -276,25 +276,26 @@ class Strategist:
         """Lee el radar de impactos del simulador. En scenario 131 se actualiza
         con la posicion donde cae cada bala dentro de 500 m.
 
-        Si la posicion radar es no nula y cambio recientemente respecto al
-        ultimo sample => hay disparo cayendo cerca. Devuelve True para
-        gatillar evasion.
+        Bug-fix: solo gatilla cuando el VALOR cambia (impacto nuevo). El
+        valor inicial del radar puede ser no-cero y constante; eso es ruido,
+        no fuego real.
         """
         rx = float(mine[td['radarx']])
         ry = float(mine[td['radary']])
         rz = float(mine[td['radarz']])
         if rx == 0.0 and ry == 0.0 and rz == 0.0:
+            self._last_radar_changed_at = None
             return False
-        prev = getattr(self, '_last_radar', None)
-        self._last_radar = (rx, ry, rz, timer)
-        if prev is None:
-            return True
-        if (abs(rx - prev[0]) > 1.0 or abs(rz - prev[2]) > 1.0):
-            # impacto nuevo, distinto del anterior
-            return True
-        if timer - prev[3] < 30:    # 1.5 s desde el ultimo cambio
-            return True
-        return False
+        prev_val = getattr(self, '_last_radar_val', None)
+        # detectar cambio real
+        if prev_val is None or abs(rx - prev_val[0]) > 1.0 or abs(rz - prev_val[2]) > 1.0:
+            self._last_radar_changed_at = timer
+            self._last_radar_val = (rx, ry, rz)
+        # solo flag activo durante 30 ticks (~1.5 s) tras el ultimo cambio
+        changed = getattr(self, '_last_radar_changed_at', None)
+        if changed is None:
+            return False
+        return (timer - changed) < 30
 
     def _decide(self, mine: tuple, other: tuple) -> dict:
         my_x = float(mine[td['x']])
@@ -433,11 +434,14 @@ class Strategist:
                 forced = True
         if incoming_fire:
             forced = True
-        # solo aplicar zigzag forzado si NO estamos en maniobra de unstuck
+        # Solo aplicar zigzag forzado si NO estamos en maniobra de unstuck.
+        # Y solo bumpear thrust si el chasis ya esta alineado (sino seguimos
+        # rotando en lugar de spiralar).
         if forced and self._unstuck_until is None:
             forced_offset = self._zigzag_heading_offset()
             steering = self.heading_pid.step(heading_sp + forced_offset, my_az, dt)
-            thrust = max(thrust, 12.0)
+            if chassis_err < 30:
+                thrust = max(thrust, 12.0)
 
         return dict(
             timer=timer,
