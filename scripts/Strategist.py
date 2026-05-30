@@ -4,6 +4,7 @@ Strategist.py — agente competitivo para Escenario 111 (duelo de tanques).
 Combina:
   - scripts/Ballistic.py        modelo balistico y solver de lead
   - scripts/OpponentProfiler.py clasificacion del estilo rival en vivo
+  - scripts/PID.py              controladores PID para heading y distancia
 
 Politicas implementadas:
   SNIPER     pararse y apuntar fino — vs rival STATIC o lento
@@ -12,6 +13,22 @@ Politicas implementadas:
   KITE       mantener distancia mientras el rival se acerca — vs AGGRESSIVE
   CHASE      perseguir a velocidad maxima — vs EVASIVE
   OBSERVE    moverse en arco lateral sin disparar, para observar — primeros 5 s
+
+Arquitectura de control:
+  Dos PID en cascada con el solver balistico:
+
+  1) heading_pid:   setpoint = bearing al rival (o + offset segun politica)
+                    pv       = azimuth del chasis
+                    salida   = steering en [-1, +1]
+                    Mantiene el chasis apuntado donde queremos ir.
+
+  2) distance_pid:  setpoint = distancia ideal de la postura activa
+                    pv       = distancia actual al rival
+                    salida   = thrust en [-28, +28] m/s
+                    Acerca o retrocede automaticamente sin if/else por postura.
+
+  La torreta no usa PID porque puede girar al angulo deseado en 1 tick;
+  la apuntamos directo con la salida del solver balistico (lead incluido).
 
 Uso (igual que SeekAndDestroy.py):
     python3 scripts/Strategist.py 1     # controlar tanque 1
@@ -22,7 +39,8 @@ Diferenciacion frente a SeekAndDestroy.py:
   2. Solo dispara cuando el error angular esta debajo de umbral
      (ahorra power, evita gastar municion al pedo).
   3. Reconoce el estilo del rival y cambia de politica.
-  4. Evade activamente cuando lo necesita.
+  4. Movimiento controlado por PID (suave, sin chattering, sin overshoot).
+  5. Evade activamente cuando lo necesita.
 """
 
 from __future__ import annotations
@@ -45,6 +63,7 @@ from Ballistic import (
     SIM_DT,
 )
 from OpponentProfiler import OpponentProfiler
+from PID import PIDController, normalize_angle_deg
 
 # wakuseibokan: comando 11 = disparar
 FIRE = 11
@@ -82,6 +101,23 @@ class VelocityEstimator:
 
 
 class Strategist:
+    # ---------------------- Ganancias PID por defecto ----------------------
+    # Ajustables tras observar episodios reales (ver docs/NeuroRobotics.md).
+    #
+    # Heading: error en grados ([-180, 180] tras normalizar), salida steering
+    # en [-1, +1]. Con kp=0.04, error de 25 grados ya satura la salida.
+    HEADING_KP = 0.04
+    HEADING_KI = 0.0005
+    HEADING_KD = 0.015
+    HEADING_INT_LIMIT = 30.0   # acumulacion de grados-segundo
+
+    # Distancia: error en metros, salida thrust en [-28, +28] m/s.
+    # kp=0.04 => 200 m de error saturan al maximo.
+    DISTANCE_KP = 0.04
+    DISTANCE_KI = 0.0002
+    DISTANCE_KD = 0.08
+    DISTANCE_INT_LIMIT = 500.0
+
     def __init__(self, tank_id: int):
         self.tank_id = int(tank_id)
         # mi puerto de escucha de telemetria
@@ -97,12 +133,30 @@ class Strategist:
         self.profiler = OpponentProfiler()
         self.vel_est = VelocityEstimator()
 
-        self.policy = 'OBSERVE'
-        self.last_print = 0.0
+        # PIDs (las tres proporciones por canal)
+        self.heading_pid = PIDController(
+            kp=self.HEADING_KP, ki=self.HEADING_KI, kd=self.HEADING_KD,
+            output_min=-1.0, output_max=1.0,
+            integral_min=-self.HEADING_INT_LIMIT, integral_max=self.HEADING_INT_LIMIT,
+            angular=True,
+        )
+        self.distance_pid = PIDController(
+            kp=self.DISTANCE_KP, ki=self.DISTANCE_KI, kd=self.DISTANCE_KD,
+            output_min=-28.0, output_max=28.0,
+            integral_min=-self.DISTANCE_INT_LIMIT, integral_max=self.DISTANCE_INT_LIMIT,
+            angular=False,
+        )
 
-        # zigzag interno cuando estamos evadiendo
+        self.policy = 'OBSERVE'
+        self._prev_policy = 'OBSERVE'
+        self.last_print = 0.0
+        self._last_timer: float | None = None
+
+        # zigzag interno cuando estamos evadiendo: oscilamos el setpoint de
+        # heading en +/- ZIGZAG_AMPLITUDE grados con periodo ZIGZAG_PERIOD ticks.
         self._zigzag_phase = 0
-        self._zigzag_period_ticks = 30
+        self.ZIGZAG_PERIOD_TICKS = 30
+        self.ZIGZAG_AMPLITUDE_DEG = 35.0
 
         # historial reciente de health propio para detectar que nos pegan
         self._health_history: deque[tuple[float, float]] = deque(maxlen=20)
@@ -149,11 +203,45 @@ class Strategist:
         rec = OpponentProfiler.recommend_strategy(profile.style)
         return rec['posture']
 
-    def _zigzag_steering(self, base_steer: float) -> float:
+    def _zigzag_heading_offset(self) -> float:
+        """Oscila el setpoint de heading +/- ZIGZAG_AMPLITUDE para romper el
+        lead de un rival que asume velocidad constante."""
         self._zigzag_phase += 1
-        if (self._zigzag_phase // self._zigzag_period_ticks) % 2 == 0:
-            return base_steer + 0.6
-        return base_steer - 0.6
+        if (self._zigzag_phase // self.ZIGZAG_PERIOD_TICKS) % 2 == 0:
+            return +self.ZIGZAG_AMPLITUDE_DEG
+        return -self.ZIGZAG_AMPLITUDE_DEG
+
+    def _setpoints_for_policy(self, policy: str, bearing_to_rival: float,
+                              dist: float, ideal_dist: float) -> tuple[float, float, str]:
+        """Devuelve (heading_setpoint_world, distance_setpoint, fire_lock).
+
+        fire_lock indica si la politica habilita disparo:
+            'OK'   apuntar y disparar normalmente
+            'NO'   no disparar (OBSERVE, EVADE_NO_FIRE)
+        """
+        if policy == 'OBSERVE':
+            # circular: apuntar perpendicular al rival, mantener distancia actual
+            return bearing_to_rival + 90.0, dist, 'NO'
+        if policy == 'SNIPER':
+            # frenar y apuntar fino: setpoint de distancia == distancia actual
+            # => el PID de distancia genera thrust ~ 0 sin if/else manual.
+            return bearing_to_rival, dist, 'OK'
+        if policy == 'LEAD':
+            return bearing_to_rival, ideal_dist, 'OK'
+        if policy == 'CLOSE':
+            return bearing_to_rival + self._zigzag_heading_offset(), ideal_dist, 'OK'
+        if policy == 'KITE':
+            # encarar al rival pero querer estar a 900 m: si el rival se acerca
+            # (dist < 900), el distance_pid manda thrust negativo => retrocede.
+            return bearing_to_rival + self._zigzag_heading_offset(), ideal_dist, 'OK'
+        if policy == 'CHASE':
+            return bearing_to_rival, max(ideal_dist - 400, 200), 'OK'
+        if policy == 'EVADE_NO_FIRE':
+            # perpendicular + zigzag, mantener distancia
+            return (bearing_to_rival + 90.0 + self._zigzag_heading_offset(),
+                    max(dist, 1500.0), 'NO')
+        # default conservador
+        return bearing_to_rival, dist, 'NO'
 
     def _decide(self, mine: tuple, other: tuple) -> dict:
         my_x = float(mine[td['x']])
@@ -169,6 +257,13 @@ class Strategist:
         his_pw = float(other[td['power']])
         timer = float(mine[td['timer']])
 
+        # dt para los PIDs (en segundos reales del simulador)
+        if self._last_timer is None:
+            dt = SIM_DT
+        else:
+            dt = max((timer - self._last_timer) * SIM_DT, SIM_DT)
+        self._last_timer = timer
+
         # actualizar profiler y estimador
         self.profiler.update(timer, my_x, my_z, my_hp,
                              his_x, his_z, his_az, his_pw, his_hp)
@@ -177,7 +272,7 @@ class Strategist:
         # registrar health
         self._health_history.append((timer, my_hp))
 
-        # distancia y lead point
+        # ---------- 1) Apunteria balistica (torreta, sin PID) ----------
         dist = math.hypot(his_x - my_x, his_z - my_z)
         intercept = solve_moving_intercept(
             shooter_xz=(my_x, my_z),
@@ -185,83 +280,61 @@ class Strategist:
             target_vel_xz=(vx, vz),
             table=self.ballistic,
         )
+        bearing_to_rival = math.degrees(math.atan2(his_x - my_x, his_z - my_z))
+        if intercept is None:
+            turret_decl = 0.0
+            turret_bearing = world_bearing_to_turret(bearing_to_rival, my_az)
+            aim_error = abs(turret_bearing)
+        else:
+            turret_decl = intercept['decl_deg']
+            turret_bearing = world_bearing_to_turret(intercept['bearing_world_deg'], my_az)
+            aim_error = abs(turret_bearing)
 
-        # politica
+        # ---------- 2) Eleccion de politica ----------
         profile = self.profiler.classify()
-        if timer < 100:        # primeros ~5 s siempre OBSERVE
+        if timer < 100:
             policy = 'OBSERVE'
         else:
             policy = self._select_policy(profile, my_hp, my_pw)
+
+        # si cambio la politica, reset de los terminos integrales para evitar
+        # que el integral acumulado de la politica anterior contamine la nueva
+        if policy != self._prev_policy:
+            self.heading_pid.reset()
+            self.distance_pid.reset()
+            self._prev_policy = policy
         self.policy = policy
 
         rec = OpponentProfiler.recommend_strategy(profile.style)
         ideal_dist = rec['close_to']
         max_aim_error = rec['fire_when_aim_error_below_deg']
 
-        # apuntado
-        if intercept is None:
-            # fuera de rango: encarar al rival y avanzar
-            turret_decl = 0.0
-            world_bearing = math.degrees(math.atan2(his_x - my_x, his_z - my_z))
-            turret_bearing = world_bearing_to_turret(world_bearing, my_az)
-            aim_error = abs(turret_bearing)
-            fire_ok = False
-        else:
-            turret_decl = intercept['decl_deg']
-            turret_bearing = world_bearing_to_turret(intercept['bearing_world_deg'], my_az)
-            aim_error = abs(turret_bearing)
-            fire_ok = aim_error < max_aim_error and my_pw > 20
+        # ---------- 3) Setpoints segun politica ----------
+        heading_sp, distance_sp, fire_lock = self._setpoints_for_policy(
+            policy, bearing_to_rival, dist, ideal_dist
+        )
 
-        # movimiento por politica
-        thrust = 0.0
-        steering = 0.0
+        # ---------- 4) PID heading (chasis -> direccion deseada) ----------
+        steering = self.heading_pid.step(heading_sp, my_az, dt)
 
-        if policy == 'OBSERVE':
-            # arco lateral suave, sin disparar
-            thrust = 10.0
-            steering = 0.3
-            fire_ok = False
-        elif policy == 'SNIPER':
-            # parar y apuntar
-            thrust = 0.0
-            steering = 0.0
-        elif policy == 'LEAD':
-            if dist > ideal_dist + 100:
-                thrust = 15.0
-            elif dist < ideal_dist - 100:
-                thrust = -8.0
-            steering = 0.2 if turret_bearing > 0 else -0.2
-        elif policy == 'CLOSE':
-            # acercarse rapido, despues frenar a ideal_dist
-            thrust = 20.0 if dist > ideal_dist else 0.0
-            steering = self._zigzag_steering(0.0)
-        elif policy == 'KITE':
-            # rival viene, alejarse manteniendo apuntado
-            if dist < ideal_dist:
-                thrust = -15.0
-            else:
-                thrust = 5.0
-            steering = self._zigzag_steering(0.2)
-        elif policy == 'CHASE':
-            thrust = 28.0
-            # apuntar el chasis al rival mientras corro
-            world_bearing = math.degrees(math.atan2(his_x - my_x, his_z - my_z))
-            chassis_err = world_bearing_to_turret(world_bearing, my_az)
-            steering = 0.5 if chassis_err > 0 else -0.5
-        elif policy == 'EVADE_NO_FIRE':
-            thrust = 15.0
-            steering = self._zigzag_steering(0.0)
-            fire_ok = False
-        else:
-            # default conservador
-            thrust = 0.0
-            steering = 0.0
+        # ---------- 5) PID distancia (acercarse / retroceder) ----------
+        # error positivo = estamos mas lejos => avanzar (thrust > 0).
+        # error negativo = estamos mas cerca  => retroceder (thrust < 0).
+        thrust = self.distance_pid.step(distance_sp, dist, dt)
 
-        # si nos pegaron en los ultimos 2 s, zigzag forzado
+        # ---------- 6) Disparo ----------
+        fire_ok = (fire_lock == 'OK'
+                   and aim_error < max_aim_error
+                   and my_pw > 20
+                   and intercept is not None)
+
+        # ---------- 7) Reaccion defensiva: si nos pegaron, forzar zigzag ----------
         if len(self._health_history) >= 2:
             recent_loss = self._health_history[0][1] - self._health_history[-1][1]
             if recent_loss > 5:
-                steering = self._zigzag_steering(steering)
+                # forzar zigzag mas agresivo aplicandolo encima del setpoint
+                forced_offset = self._zigzag_heading_offset()
+                steering = self.heading_pid.step(heading_sp + forced_offset, my_az, dt)
                 thrust = max(thrust, 12.0)
 
         return dict(
@@ -272,9 +345,14 @@ class Strategist:
             turret_bearing=turret_bearing,
             fire_ok=fire_ok,
             distance=dist,
+            distance_sp=distance_sp,
+            heading_sp=heading_sp,
+            heading_err=normalize_angle_deg(heading_sp - my_az),
             aim_error=aim_error,
             policy=policy,
             profile=profile,
+            pid_h=(self.heading_pid.last_p, self.heading_pid.last_i, self.heading_pid.last_d),
+            pid_d=(self.distance_pid.last_p, self.distance_pid.last_i, self.distance_pid.last_d),
         )
 
     def _print_status(self, decision: dict, mine: tuple) -> None:
@@ -283,15 +361,19 @@ class Strategist:
             return
         self.last_print = now
         prof = decision['profile']
+        ph, ih, dh = decision['pid_h']
+        pd, idi, dd = decision['pid_d']
         print(
             f"t={int(mine[td['timer']]):>6} "
             f"hp={mine[td['health']]:6.0f} pw={mine[td['power']]:4.0f} "
             f"pol={decision['policy']:<14} "
-            f"dist={decision['distance']:6.0f}m "
-            f"aim_err={decision['aim_error']:5.2f}deg "
-            f"fire={'Y' if decision['fire_ok'] else '-'} "
+            f"dist={decision['distance']:6.0f}/{decision['distance_sp']:6.0f}m "
+            f"hdg_err={decision['heading_err']:+6.1f}deg "
+            f"steer={decision['steering']:+5.2f} thrust={decision['thrust']:+6.2f} "
+            f"aim_err={decision['aim_error']:5.2f}deg fire={'Y' if decision['fire_ok'] else '-'} "
             f"|| profile={prof.style}({prof.confidence:.1f}) "
-            f"sp={prof.avg_speed:4.1f} appr={prof.approach_rate:+4.1f}"
+            f"PIDh(P{ph:+5.2f} I{ih:+5.2f} D{dh:+5.2f}) "
+            f"PIDd(P{pd:+5.1f} I{idi:+5.1f} D{dd:+5.1f})"
         )
 
     def run(self) -> None:
@@ -331,22 +413,34 @@ class Strategist:
 
 def _self_test() -> None:
     """Smoke test: corre _decide() con un stream sintetico."""
-    class _StubSock:
-        def settimeout(self, x): pass
-        def bind(self, x): pass
-
     s = Strategist.__new__(Strategist)   # no llamar __init__ (abriria socket)
     s.tank_id = 1
     s.ballistic = BallisticTable()
     s.profiler = OpponentProfiler()
     s.vel_est = VelocityEstimator()
+    s.heading_pid = PIDController(
+        kp=Strategist.HEADING_KP, ki=Strategist.HEADING_KI, kd=Strategist.HEADING_KD,
+        output_min=-1.0, output_max=1.0,
+        integral_min=-Strategist.HEADING_INT_LIMIT,
+        integral_max=Strategist.HEADING_INT_LIMIT,
+        angular=True,
+    )
+    s.distance_pid = PIDController(
+        kp=Strategist.DISTANCE_KP, ki=Strategist.DISTANCE_KI, kd=Strategist.DISTANCE_KD,
+        output_min=-28.0, output_max=28.0,
+        integral_min=-Strategist.DISTANCE_INT_LIMIT,
+        integral_max=Strategist.DISTANCE_INT_LIMIT,
+        angular=False,
+    )
     s.policy = 'OBSERVE'
+    s._prev_policy = 'OBSERVE'
     s.last_print = 0.0
+    s._last_timer = None
     s._zigzag_phase = 0
-    s._zigzag_period_ticks = 30
+    s.ZIGZAG_PERIOD_TICKS = 30
+    s.ZIGZAG_AMPLITUDE_DEG = 35.0
     s._health_history = deque(maxlen=20)
 
-    # construir telemetrias "fake" con todos los campos en el orden de TelemetryDictionary
     def fake_tel(number, x, z, az, hp, pw, timer):
         # 24 fields: timer, lastUpdate, number, hp, pw, az, rx, ry, rz, x, y, z, R1..R12
         return (timer, timer, number, hp, pw, az,
@@ -354,16 +448,23 @@ def _self_test() -> None:
                 x, 10.0, z,
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
-    # Escenario sintetico: rival cierra distancia a 15 m/s desde el norte
-    print(f"{'tick':>5} {'policy':<14} {'dist':>6} {'aim_err':>7} {'fire':>4}")
-    for tick in range(0, 6000, 100):
-        his_z = 2000.0 - 15.0 * tick * SIM_DT
+    # rival se acerca a 15 m/s desde el norte, telemetria a 20 Hz
+    print(f"{'tick':>5} {'policy':<14} {'dist':>6} {'dist_sp':>7} "
+          f"{'hdg_err':>7} {'steer':>6} {'thrust':>7} {'aim':>6} {'fire':>4}")
+    his_z = 2000.0
+    for tick in range(0, 200 * 20, 1):
+        if tick > 0 and tick % 1 == 0:
+            his_z -= 15.0 * SIM_DT     # avanza 0.75 m por tick
         mine = fake_tel(1, 0.0, 0.0, 0.0, 1000.0, 1000.0, tick)
-        other = fake_tel(2, 0.0, his_z, 180.0, 1000.0, 1000.0 - (tick // 200), tick)
+        other = fake_tel(2, 0.0, his_z, 180.0, 1000.0,
+                         1000.0 - (tick // 80), tick)
         d = s._decide(mine, other)
-        if tick % 500 == 0:
+        if tick % 200 == 0:
             print(f"{tick:>5} {d['policy']:<14} "
-                  f"{d['distance']:>6.0f} {d['aim_error']:>7.2f} {'Y' if d['fire_ok'] else '-':>4}")
+                  f"{d['distance']:>6.0f} {d['distance_sp']:>7.0f} "
+                  f"{d['heading_err']:>+7.1f} {d['steering']:>+6.2f} "
+                  f"{d['thrust']:>+7.2f} {d['aim_error']:>6.2f} "
+                  f"{'Y' if d['fire_ok'] else '-':>4}")
 
 
 if __name__ == '__main__':
