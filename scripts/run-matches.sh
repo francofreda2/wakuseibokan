@@ -81,7 +81,7 @@ wait_for_match_end() {
   # Espero hasta que aparezcan las dos lineas Faction:N para el match actual.
   # Despues de "Cleaning up sceneario to start it over again" arranca el proximo.
   local prev_factions
-  prev_factions=$(grep -c "^Faction: " data/run/sim.log 2>/dev/null || echo 0)
+  prev_factions=$(grep "^Faction: " data/run/sim.log 2>/dev/null | wc -l)
   local timeout=400  # segundos wall-clock por match
   local elapsed=0
   while [ $elapsed -lt $timeout ]; do
@@ -92,7 +92,7 @@ wait_for_match_end() {
       return 1
     fi
     local now_factions
-    now_factions=$(grep -c "^Faction: " data/run/sim.log 2>/dev/null || echo 0)
+    now_factions=$(grep "^Faction: " data/run/sim.log 2>/dev/null | wc -l)
     if [ "$now_factions" -ge $((prev_factions + 2)) ]; then
       return 0
     fi
