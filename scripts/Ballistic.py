@@ -111,17 +111,22 @@ def simulate_trajectory(decl_deg: float,
         pos.append(p.copy())
         vel.append(v.copy())
 
-        # Cruce descendente con target_height (solo si vamos bajando)
-        if impact_t is None and v[1] < 0 and p[1] <= target_height <= prev_y:
-            # interpolar linealmente entre el step previo y este
+        # Cruce con target_height (primer cruce, ascendente o descendente).
+        # Si target esta arriba del muzzle, el primer cruce es ascendente
+        # (tiro directo); si esta abajo, el unico cruce es descendente.
+        if impact_t is None and (
+            (prev_y <= target_height <= p[1]) or (p[1] <= target_height <= prev_y)
+        ):
             prev_p = pos[-2]
-            alpha = (prev_p[1] - target_height) / (prev_p[1] - p[1])
-            hit = prev_p + alpha * (p - prev_p)
-            impact_t = times[-2] + alpha * (t - times[-2])
-            impact_xz = (float(hit[0]), float(hit[2]))
-            impact_distance = float(np.linalg.norm(
-                np.array([hit[0], hit[2]]) - horizontal_start
-            ))
+            denom = p[1] - prev_p[1]
+            if abs(denom) > 1e-9:
+                alpha = (target_height - prev_p[1]) / denom
+                hit = prev_p + alpha * (p - prev_p)
+                impact_t = times[-2] + alpha * (t - times[-2])
+                impact_xz = (float(hit[0]), float(hit[2]))
+                impact_distance = float(np.linalg.norm(
+                    np.array([hit[0], hit[2]]) - horizontal_start
+                ))
         prev_y = p[1]
 
     return Trajectory(
@@ -197,11 +202,62 @@ class BallisticTable:
         tof = float(np.interp(distance, self._dists, self._tofs))
         return decl, tof
 
+    def aim_with_height(self, distance: float,
+                        shooter_y: float, target_y: float) -> tuple[float, float] | None:
+        """Variante de aim() que compensa por diferencia de altura entre tanque
+        y blanco. Necesario en escenario 131 (terreno con elevacion).
+
+        Si la diferencia es chica (<3 m) usa la tabla. Si no, refina con
+        biseccion sobre la simulacion para encontrar el decl que hace que la
+        bala cruce target_y a la distancia pedida.
+        """
+        dh = target_y - shooter_y
+        # caso facil: terreno plano
+        if abs(dh) < 3.0:
+            return self.aim(distance)
+        # arrancamos con la estimacion plana y agregamos correccion geometrica
+        flat = self.aim(distance)
+        if flat is None:
+            return None
+        decl0, tof0 = flat
+        # correccion de primer orden: extra angulo para subir o bajar dh
+        # delta_decl ~ atan(dh / distancia) en grados
+        delta = math.degrees(math.atan2(dh, distance))
+        guess = decl0 + delta
+        # refinar con simulacion: variar decl hasta que la trayectoria cruce
+        # target_y_absoluto = shooter_y + dh dentro de tolerancia
+        target_y_abs = shooter_y + dh
+        best = guess
+        best_err = float('inf')
+        best_tof = tof0
+        # busqueda local 4 grados alrededor de guess, paso 0.05 deg
+        for d_offset in np.arange(-4.0, 4.0, 0.05):
+            d_try = guess + d_offset
+            traj = simulate_trajectory(
+                decl_deg=float(d_try),
+                shooter_pos=(0.0, shooter_y, 0.0),
+                target_height=target_y_abs,
+            )
+            if traj.impact_distance is None:
+                continue
+            err = abs(traj.impact_distance - distance)
+            if err < best_err:
+                best_err = err
+                best = float(d_try)
+                best_tof = float(traj.impact_t)
+            if err < 2.0:   # convergencia
+                break
+        if best_err > 50.0:   # no encontro algo razonable
+            return None
+        return best, best_tof
+
 
 def solve_moving_intercept(shooter_xz: tuple[float, float],
                            target_xz: tuple[float, float],
                            target_vel_xz: tuple[float, float],
                            table: BallisticTable,
+                           shooter_y: float | None = None,
+                           target_y: float | None = None,
                            max_iter: int = 5,
                            tol: float = 0.5) -> dict | None:
     """Resuelve el punto de impacto contra un blanco que se mueve linealmente.
@@ -209,12 +265,24 @@ def solve_moving_intercept(shooter_xz: tuple[float, float],
     Itera: dado el target en su posicion actual, estima tiempo de vuelo,
     proyecta el target a (pos + vel * tof), recalcula tiempo de vuelo, repite.
 
+    En escenario 131 (terreno variado) pasa shooter_y y target_y para que el
+    solver compense la diferencia de altura. Si no se pasan, usa la tabla
+    plana (asume misma altura).
+
     Devuelve dict con decl_deg, bearing_world_deg (azimuth absoluto al
-    punto liderado), tof_s, lead_point_xz; o None si fuera de rango.
+    punto liderado), tof_s, lead_point_xz, distance_m; o None si fuera de rango.
     """
     sx, sz = shooter_xz
     tx, tz = target_xz
     vx, vz = target_vel_xz
+
+    use_height = (shooter_y is not None and target_y is not None
+                  and abs(shooter_y - target_y) >= 3.0)
+
+    def _aim_for(d: float) -> tuple[float, float] | None:
+        if use_height:
+            return table.aim_with_height(d, shooter_y, target_y)
+        return table.aim(d)
 
     lead_x, lead_z = tx, tz
     decl, tof = None, None
@@ -222,7 +290,7 @@ def solve_moving_intercept(shooter_xz: tuple[float, float],
         dx = lead_x - sx
         dz = lead_z - sz
         d = math.hypot(dx, dz)
-        aim = table.aim(d)
+        aim = _aim_for(d)
         if aim is None:
             return None
         new_decl, new_tof = aim
@@ -241,6 +309,7 @@ def solve_moving_intercept(shooter_xz: tuple[float, float],
         'tof_s': tof,
         'lead_point_xz': (lead_x, lead_z),
         'distance_m': math.hypot(lead_x - sx, lead_z - sz),
+        'height_corrected': use_height,
     }
 
 

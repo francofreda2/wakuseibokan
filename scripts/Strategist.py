@@ -243,14 +243,40 @@ class Strategist:
         # default conservador
         return bearing_to_rival, dist, 'NO'
 
+    def _detect_incoming_fire(self, mine: tuple, timer: float) -> bool:
+        """Lee el radar de impactos del simulador. En scenario 131 se actualiza
+        con la posicion donde cae cada bala dentro de 500 m.
+
+        Si la posicion radar es no nula y cambio recientemente respecto al
+        ultimo sample => hay disparo cayendo cerca. Devuelve True para
+        gatillar evasion.
+        """
+        rx = float(mine[td['radarx']])
+        ry = float(mine[td['radary']])
+        rz = float(mine[td['radarz']])
+        if rx == 0.0 and ry == 0.0 and rz == 0.0:
+            return False
+        prev = getattr(self, '_last_radar', None)
+        self._last_radar = (rx, ry, rz, timer)
+        if prev is None:
+            return True
+        if (abs(rx - prev[0]) > 1.0 or abs(rz - prev[2]) > 1.0):
+            # impacto nuevo, distinto del anterior
+            return True
+        if timer - prev[3] < 30:    # 1.5 s desde el ultimo cambio
+            return True
+        return False
+
     def _decide(self, mine: tuple, other: tuple) -> dict:
         my_x = float(mine[td['x']])
+        my_y = float(mine[td['y']])
         my_z = float(mine[td['z']])
         my_az = float(mine[td['azimuth']])
         my_hp = float(mine[td['health']])
         my_pw = float(mine[td['power']])
 
         his_x = float(other[td['x']])
+        his_y = float(other[td['y']])
         his_z = float(other[td['z']])
         his_az = float(other[td['azimuth']])
         his_hp = float(other[td['health']])
@@ -279,7 +305,12 @@ class Strategist:
             target_xz=(his_x, his_z),
             target_vel_xz=(vx, vz),
             table=self.ballistic,
+            shooter_y=my_y,    # compensar dif de altura (escenario 131)
+            target_y=his_y,
         )
+
+        # ---------- 1b) Detectar fuego enemigo via radar de impactos ----------
+        incoming_fire = self._detect_incoming_fire(mine, timer)
         bearing_to_rival = math.degrees(math.atan2(his_x - my_x, his_z - my_z))
         if intercept is None:
             turret_decl = 0.0
@@ -328,14 +359,20 @@ class Strategist:
                    and my_pw > 20
                    and intercept is not None)
 
-        # ---------- 7) Reaccion defensiva: si nos pegaron, forzar zigzag ----------
+        # ---------- 7) Reaccion defensiva ----------
+        # 7a) Hit reciente => zigzag forzado
+        forced = False
         if len(self._health_history) >= 2:
             recent_loss = self._health_history[0][1] - self._health_history[-1][1]
             if recent_loss > 5:
-                # forzar zigzag mas agresivo aplicandolo encima del setpoint
-                forced_offset = self._zigzag_heading_offset()
-                steering = self.heading_pid.step(heading_sp + forced_offset, my_az, dt)
-                thrust = max(thrust, 12.0)
+                forced = True
+        # 7b) Radar detecto impactos cerca (scenario 131) => evasion preventiva
+        if incoming_fire:
+            forced = True
+        if forced:
+            forced_offset = self._zigzag_heading_offset()
+            steering = self.heading_pid.step(heading_sp + forced_offset, my_az, dt)
+            thrust = max(thrust, 12.0)
 
         return dict(
             timer=timer,
@@ -351,6 +388,8 @@ class Strategist:
             aim_error=aim_error,
             policy=policy,
             profile=profile,
+            incoming_fire=incoming_fire,
+            height_diff=his_y - my_y,
             pid_h=(self.heading_pid.last_p, self.heading_pid.last_i, self.heading_pid.last_d),
             pid_d=(self.distance_pid.last_p, self.distance_pid.last_i, self.distance_pid.last_d),
         )
@@ -361,19 +400,17 @@ class Strategist:
             return
         self.last_print = now
         prof = decision['profile']
-        ph, ih, dh = decision['pid_h']
-        pd, idi, dd = decision['pid_d']
         print(
             f"t={int(mine[td['timer']]):>6} "
             f"hp={mine[td['health']]:6.0f} pw={mine[td['power']]:4.0f} "
             f"pol={decision['policy']:<14} "
             f"dist={decision['distance']:6.0f}/{decision['distance_sp']:6.0f}m "
-            f"hdg_err={decision['heading_err']:+6.1f}deg "
+            f"dy={decision['height_diff']:+5.1f} "
+            f"hdg_err={decision['heading_err']:+6.1f} "
             f"steer={decision['steering']:+5.2f} thrust={decision['thrust']:+6.2f} "
-            f"aim_err={decision['aim_error']:5.2f}deg fire={'Y' if decision['fire_ok'] else '-'} "
-            f"|| profile={prof.style}({prof.confidence:.1f}) "
-            f"PIDh(P{ph:+5.2f} I{ih:+5.2f} D{dh:+5.2f}) "
-            f"PIDd(P{pd:+5.1f} I{idi:+5.1f} D{dd:+5.1f})"
+            f"aim_err={decision['aim_error']:5.2f} fire={'Y' if decision['fire_ok'] else '-'} "
+            f"INFIRE={'!' if decision['incoming_fire'] else ' '} "
+            f"|| {prof.style}({prof.confidence:.1f})"
         )
 
     def run(self) -> None:
@@ -441,11 +478,12 @@ def _self_test() -> None:
     s.ZIGZAG_AMPLITUDE_DEG = 35.0
     s._health_history = deque(maxlen=20)
 
-    def fake_tel(number, x, z, az, hp, pw, timer):
+    def fake_tel(number, x, z, az, hp, pw, timer, y=10.0,
+                 radarx=0.0, radary=0.0, radarz=0.0):
         # 24 fields: timer, lastUpdate, number, hp, pw, az, rx, ry, rz, x, y, z, R1..R12
         return (timer, timer, number, hp, pw, az,
-                0.0, 0.0, 0.0,
-                x, 10.0, z,
+                radarx, radary, radarz,
+                x, y, z,
                 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
     # rival se acerca a 15 m/s desde el norte, telemetria a 20 Hz
