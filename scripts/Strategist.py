@@ -112,10 +112,11 @@ class Strategist:
     HEADING_INT_LIMIT = 30.0   # acumulacion de grados-segundo
 
     # Distancia: error en metros, salida thrust en [-28, +28] m/s.
-    # kp=0.04 => 200 m de error saturan al maximo.
-    DISTANCE_KP = 0.04
-    DISTANCE_KI = 0.0002
-    DISTANCE_KD = 0.08
+    # Mas agresivo: kp=0.10 => 50 m de error saturan al maximo => acelera fuerte
+    # en cuanto se aleja del setpoint. Kd alto para frenar antes de cruzarlo.
+    DISTANCE_KP = 0.10
+    DISTANCE_KI = 0.0003
+    DISTANCE_KD = 0.15
     DISTANCE_INT_LIMIT = 500.0
 
     def __init__(self, tank_id: int):
@@ -350,8 +351,10 @@ class Strategist:
             aim_error = abs(turret_bearing)
 
         # ---------- 2) Eleccion de politica ----------
+        # Mas corto: solo 30 ticks (1.5 s) de observe — suficiente para que
+        # el profiler tenga MIN_SAMPLES_FOR_CLASSIFY=30 muestras.
         profile = self.profiler.classify()
-        if timer < 100:
+        if timer < 30:
             policy = 'OBSERVE'
         else:
             policy = self._select_policy(profile, my_hp, my_pw)

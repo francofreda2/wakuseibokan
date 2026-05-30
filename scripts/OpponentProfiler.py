@@ -239,12 +239,14 @@ class OpponentProfiler:
     def recommend_strategy(style: str) -> dict:
         """Devuelve hints estrategicos como dict — interpreta el Strategist."""
         recs = {
-            'STATIC':     dict(posture='SNIPER',     close_to=1500, evasion=False, fire_when_aim_error_below_deg=0.4),
-            'LINEAR':     dict(posture='LEAD',       close_to=1200, evasion=False, fire_when_aim_error_below_deg=0.5),
-            'ZIGZAG':     dict(posture='CLOSE',      close_to=600,  evasion=True,  fire_when_aim_error_below_deg=0.6),
-            'AGGRESSIVE': dict(posture='KITE',       close_to=900,  evasion=True,  fire_when_aim_error_below_deg=0.5),
-            'EVASIVE':    dict(posture='CHASE',      close_to=800,  evasion=False, fire_when_aim_error_below_deg=0.5),
-            'UNKNOWN':    dict(posture='OBSERVE',    close_to=1200, evasion=True,  fire_when_aim_error_below_deg=0.3),
+            # Tuneo: cerrar mas que antes (mas agresivo), bajar el umbral
+            # de error de aim para disparar mas seguido cuando estamos cerca.
+            'STATIC':     dict(posture='SNIPER',     close_to=1200, evasion=False, fire_when_aim_error_below_deg=0.5),
+            'LINEAR':     dict(posture='LEAD',       close_to=900,  evasion=False, fire_when_aim_error_below_deg=0.7),
+            'ZIGZAG':     dict(posture='CLOSE',      close_to=500,  evasion=True,  fire_when_aim_error_below_deg=1.0),
+            'AGGRESSIVE': dict(posture='KITE',       close_to=700,  evasion=True,  fire_when_aim_error_below_deg=0.6),
+            'EVASIVE':    dict(posture='CHASE',      close_to=400,  evasion=False, fire_when_aim_error_below_deg=0.7),
+            'UNKNOWN':    dict(posture='OBSERVE',    close_to=1000, evasion=True,  fire_when_aim_error_below_deg=0.4),
         }
         return recs.get(style, recs['UNKNOWN'])
 
