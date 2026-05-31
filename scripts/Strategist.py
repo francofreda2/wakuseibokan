@@ -78,10 +78,15 @@ TELEMETRY_LEN = 84 + 3 * 4   # 96 bytes
 
 
 class VelocityEstimator:
-    """Estimador de velocidad rival con EMA (filtro exponencial)."""
+    """Estimador de velocidad rival: derivada directa frame-a-frame.
 
-    def __init__(self, alpha: float = 0.4):
-        self._alpha = alpha
+    Antes usaba EMA con alpha=0.4 pero introducia lag de 1-2 ticks que
+    contra un blanco moviendose a 28 m/s y con 2.5s de tiempo de vuelo
+    nos hacia errar shots por varios metros. SmartLead usa derivada
+    directa y nos sacaba 30% mas hits. Aprendimos.
+    """
+
+    def __init__(self):
         self._last_pos: tuple[float, float, float] | None = None
         self._vel = (0.0, 0.0)
 
@@ -91,11 +96,7 @@ class VelocityEstimator:
             return self._vel
         lx, lz, lt = self._last_pos
         dt = max(timer - lt, 1.0) * SIM_DT
-        vx_inst = (x - lx) / dt
-        vz_inst = (z - lz) / dt
-        a = self._alpha
-        self._vel = (a * vx_inst + (1 - a) * self._vel[0],
-                     a * vz_inst + (1 - a) * self._vel[1])
+        self._vel = ((x - lx) / dt, (z - lz) / dt)
         self._last_pos = (x, z, timer)
         return self._vel
 
@@ -353,20 +354,18 @@ class Strategist:
             aim_error = abs(turret_bearing)
 
         # ---------- 2) Eleccion de politica ----------
-        # Mas corto: solo 30 ticks (1.5 s) de observe — suficiente para que
-        # el profiler tenga MIN_SAMPLES_FOR_CLASSIFY=30 muestras.
+        # Sin OBSERVE inicial: SmartLead dispara desde tick 0 y nos saca dos
+        # disparos gratis de ventaja. El profiler todavia recolecta datos en
+        # background mientras nosotros ya estamos disparando con LEAD.
         profile = self.profiler.classify()
-        if timer < 30:
-            policy = 'OBSERVE'
-        else:
-            policy = self._select_policy(profile, my_hp, my_pw)
+        policy = self._select_policy(profile, my_hp, my_pw)
 
-        # si cambio la politica, reset de los terminos integrales para evitar
-        # que el integral acumulado de la politica anterior contamine la nueva
-        if policy != self._prev_policy:
-            self.heading_pid.reset()
-            self.distance_pid.reset()
-            self._prev_policy = policy
+        # No reseteamos los PIDs al cambiar postura: el setpoint cambia pero
+        # el integral acumulado sirve igual (es el mismo chasis, mismas
+        # dinamicas). Antes reseteabamos y eso causaba 0.5-1 s de
+        # estabilizacion en cada switch — durante ese tiempo el lead estaba
+        # mal contra un chasis girando, y errabamos disparos.
+        self._prev_policy = policy
         self.policy = policy
 
         rec = OpponentProfiler.recommend_strategy(profile.style)
@@ -383,9 +382,12 @@ class Strategist:
         chassis_err = abs(normalize_angle_deg(heading_sp - my_az))
 
         # ---------- 5) PID distancia (acercarse / retroceder) ----------
-        # error positivo = estamos mas lejos => avanzar (thrust > 0).
-        # error negativo = estamos mas cerca  => retroceder (thrust < 0).
-        thrust = self.distance_pid.step(distance_sp, dist, dt)
+        # IMPORTANTE: el PID genera error = setpoint - pv = sp - dist.
+        # Pero la convencion fisica que queremos es:
+        #   dist > sp (demasiado lejos)  => thrust > 0 (avanzar)
+        #   dist < sp (demasiado cerca)  => thrust < 0 (reversa)
+        # => la salida del PID viene con el signo invertido => negar.
+        thrust = -self.distance_pid.step(distance_sp, dist, dt)
 
         # Si el chasis esta muy desorientado, parar y solo rotar.
         # Avanzar mientras rotamos genera espirales que nunca llegan al rival.
